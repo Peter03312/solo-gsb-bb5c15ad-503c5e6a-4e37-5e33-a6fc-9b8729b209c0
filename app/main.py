@@ -112,6 +112,18 @@
   不得泄露正文；并发异议、开封与见证变更按写锁内结算后的状态裁定。非参与者
   与不存在编号沿用统一拒绝（403）语义。
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
+- 统一参与方判定与写事务内复核：资料及其派生资源（审计、异议、快照签发、
+  开封/替换/交接/清除/凭证等写操作）的“当前参与方”判定共用同一实现
+  （participant_document / owner_document / is_current_witness）——当前
+  封存人或当前指定见证人，以调用时刻（写事务内即提交顺序位次）的当前
+  名单为准；资料/异议编号不存在与无权沿用同一 403 拒绝。封存人交接确认、
+  见证人替换或账号停用一旦提交，旧身份立即失去资料、审计、异议与快照
+  签发权限，新身份立即按现有规则获得权限；每个已认证写事务在 BEGIN
+  IMMEDIATE 临界区内先复核密钥（失效密钥 401 并整体回滚，不触发到点
+  结算、不留业务审计），再按当前名单复核角色（403 并整体回滚），并发
+  身份变更与操作按提交顺序裁定。历史通知仍仅供原收件人在凭据有效时
+  读取/标记，不因失去资料权限而回收；无账号的一次性阅览凭证兑换与
+  可信公钥验真保持原有入口。
 - 站内通知：资料开封（opened）或到期清除（purged）时，在状态变更的同一写
   事务内向“当时封存人 + 三名见证人”各记一条；见证人替换（witness_replaced）
   时通知封存人和新旧见证人；交接确认（handover_confirmed）时通知新旧封存人
@@ -1690,21 +1702,59 @@ def revoke_pre_seal_proposal(
     return result
 
 
-def load_doc_for_participant(
-    db: sqlite3.Connection, doc_id: int, user: AuthUser
-) -> sqlite3.Row:
-    """取资料并校验参与方（封存人或指定见证人）；否则统一 403，不区分是否存在。"""
-    doc = db.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
-    if doc is None:
-        raise err(403, "无权访问该资料或资料不存在")
-    if doc["owner_id"] == user["id"]:
-        return doc
-    is_witness = db.execute(
+# ---------------------------------------------------------------------------
+# 统一参与方判定（读路径与写事务内复核共用同一实现）
+#
+# “当前参与方” = 当前封存人或当前指定见证人，以调用时刻的当前名单为准；
+# 写事务内即“本事务在 BEGIN IMMEDIATE 提交顺序中的位次”所见的名单。
+# 封存人交接确认、见证人替换或账号停用一旦提交，旧身份立即不再通过判定
+# （资料/审计/异议/快照等派生资源统一 403，不区分资料是否存在），新身份
+# 立即按现有规则通过判定；并发身份变更与操作按写事务提交顺序裁定。
+# 资料编号不存在与无权沿用同一拒绝结果（403 同文案）。
+# ---------------------------------------------------------------------------
+
+
+def is_current_witness(conn: sqlite3.Connection, doc_id: int, user_id: int) -> bool:
+    """统一“当前指定见证人”判定：以 document_witnesses 当前名单为准。"""
+    return conn.execute(
         "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-        (doc_id, user["id"]),
-    ).fetchone()
-    if is_witness is None:
-        raise err(403, "无权访问该资料或资料不存在")
+        (doc_id, user_id),
+    ).fetchone() is not None
+
+
+def participant_document(
+    conn: sqlite3.Connection,
+    doc_id: int,
+    user: AuthUser,
+    *,
+    not_found_message: str = "无权访问该资料或资料不存在",
+) -> sqlite3.Row:
+    """统一“当前参与方”判定：返回资料行；非当前参与方或不存在统一 403。
+
+    读路径与写事务内复核共用：判定只看调用时刻的当前名单——交接/替换
+    提交后旧封存人、旧见证人立即失权，新封存人、新见证人立即得权；
+    资料编号不存在与无权沿用同一 403，不区分资料是否存在。
+    """
+    doc = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    if doc is None:
+        raise err(403, not_found_message)
+    if doc["owner_id"] != user["id"] and not is_current_witness(conn, doc_id, user["id"]):
+        raise err(403, not_found_message)
+    return doc
+
+
+def owner_document(
+    conn: sqlite3.Connection, doc_id: int, user: AuthUser, *, owner_message: str
+) -> sqlite3.Row:
+    """统一“当前封存人”判定：先参与方判定（不区分存在性），再封存人判定。
+
+    与 participant_document 组合出“仅当前封存人可操作”的完整判定：
+    非参与方/不存在 -> 403「无权访问该资料或资料不存在」；
+    参与方但非封存人（见证人）-> 403 owner_message。
+    """
+    doc = participant_document(conn, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, owner_message)
     return doc
 
 
@@ -1756,7 +1806,7 @@ def get_document(
     保留摘要、参与方与审计元数据，正文永不返回。除此之外只读，不改状态。
     """
     settle_due_purges_for_read(db, doc_id, user)
-    doc = load_doc_for_participant(db, doc_id, user)
+    doc = participant_document(db, doc_id, user)
 
     witnesses = [
         row["username"]
@@ -1865,9 +1915,7 @@ def create_open_request(
     db: sqlite3.Connection = Depends(get_db),
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以提交开封请求")
+    doc = owner_document(db, doc_id, user, owner_message="只有封存人可以提交开封请求")
 
     deadline = utc_str(payload.deadline)
     earliest = utc_str(payload.earliest_open_at) if payload.earliest_open_at else None
@@ -1884,7 +1932,9 @@ def create_open_request(
         # 锁内先处理到点的定时开封与到期清除，避免与同意/撤销/扫描并发
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
-        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        # 锁内按当前名单复核封存人身份：交接确认可能在本事务等待写锁期间
+        # 提交，旧封存人随即失去权限（统一 403），本次操作整体回滚
+        doc = owner_document(tx, doc_id, user, owner_message="只有封存人可以提交开封请求")
         if doc["status"] == "purged":
             post_commit_error = err(409, "资料已清除，不能提交开封请求")
         elif doc["status"] != "sealed":
@@ -1969,11 +2019,7 @@ def approve_open_request(
     ).fetchone()
     if meta is None:
         raise err(403, "无权操作该请求或请求不存在")
-    is_witness = db.execute(
-        "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-        (meta["document_id"], user["id"]),
-    ).fetchone()
-    if is_witness is None:
+    if not is_current_witness(db, meta["document_id"], user["id"]):
         raise err(403, "只有指定见证人可以同意")
 
     now = utc_str(now_utc())
@@ -2010,10 +2056,7 @@ def approve_open_request(
                 raise err(409, f"开封请求当前状态为 {req['status']}，同意被拒绝")
             elif req["deadline"] <= now:
                 raise err(409, "已过截止时刻，同意被拒绝，请求即将失效")
-            elif not tx.execute(
-                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                (doc["id"], user["id"]),
-            ).fetchone():
+            elif not is_current_witness(tx, doc["id"], user["id"]):
                 # 见证人名单可在资料未开封时被封存人替换：进入写临界区后必须以
                 # “当前名单”为准复核，防止“预校验通过后在锁外被替换”的旧见证人投票。
                 raise err(403, "只有当前指定见证人可以同意")
@@ -2123,6 +2166,10 @@ def revoke_open_request(
         purged_here = purge_due_documents(tx, now, meta["document_id"]) > 0
         req = tx.execute("SELECT * FROM open_requests WHERE id = ?", (request_id,)).fetchone()
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (req["document_id"],)).fetchone()
+        # 锁内按当前名单复核封存人身份：交接确认可能在本事务等待写锁期间
+        # 提交，旧封存人随即失去权限（统一 403），本次操作整体回滚
+        if doc["owner_id"] != user["id"]:
+            raise err(403, "只有封存人可以撤销开封请求")
         if doc["status"] != "sealed":
             if doc["status"] == "purged":
                 not_sealed = err(409, "资料已清除，无法撤销")
@@ -2174,9 +2221,7 @@ def replace_witness(
     db: sqlite3.Connection = Depends(get_db),
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以替换见证人")
+    owner_document(db, doc_id, user, owner_message="只有封存人可以替换见证人")
 
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
@@ -2187,7 +2232,9 @@ def replace_witness(
         # 到清除时刻的资料清除。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
-        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        # 锁内按当前名单复核封存人身份：交接确认可能在本事务等待写锁期间
+        # 提交，旧封存人随即失去权限（统一 403），本次替换整体回滚
+        doc = owner_document(tx, doc_id, user, owner_message="只有封存人可以替换见证人")
         if doc["status"] != "sealed":
             # 资料已开封/已清除即不允许替换：无论状态变更是本临界区刚触发的
             # 到点判定，还是并发事务在更早时完成的，结论一致。
@@ -2215,11 +2262,8 @@ def replace_witness(
                 raise err(400, "新见证人尚未注册")
             if new_user["id"] == user["id"]:
                 raise err(400, "封存人不能同时担任见证人")
-            already = tx.execute(
-                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                (doc_id, new_user["id"]),
-            ).fetchone()
-            if already is not None:
+            already = is_current_witness(tx, doc_id, new_user["id"])
+            if already:
                 raise err(409, "新见证人已在当前见证人名单中")
             # 待确认交接邀请的受让人不能成为见证人：交接规则要求受让人始终
             # 不是当前见证人，否则确认后会出现“新封存人同时是见证人”。
@@ -2421,9 +2465,7 @@ def create_handover_invitation(
     db: sqlite3.Connection = Depends(get_db),
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以发起交接")
+    owner_document(db, doc_id, user, owner_message="只有封存人可以发起交接")
 
     deadline = utc_str(payload.confirm_deadline)
     now = utc_str(now_utc())
@@ -2460,11 +2502,7 @@ def create_handover_invitation(
                     raise err(400, "受让人尚未注册")
                 if to_user["id"] == user["id"]:
                     raise err(400, "受让人不能是封存人本人")
-                is_witness = tx.execute(
-                    "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                    (doc_id, to_user["id"]),
-                ).fetchone()
-                if is_witness is not None:
+                if is_current_witness(tx, doc_id, to_user["id"]):
                     raise err(400, "受让人不能是当前见证人")
 
                 active = tx.execute(
@@ -2790,13 +2828,10 @@ def get_handover_invitation(
         "SELECT owner_id FROM documents WHERE id = ?", (inv["document_id"],)
     ).fetchone()
     if doc is not None:
-        if doc["owner_id"] == user["id"]:
-            is_participant = True
-        else:
-            is_participant = db.execute(
-                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                (inv["document_id"], user["id"]),
-            ).fetchone() is not None
+        # 统一参与方判定：当前封存人或当前指定见证人
+        is_participant = doc["owner_id"] == user["id"] or is_current_witness(
+            db, inv["document_id"], user["id"]
+        )
     if not is_party and not is_participant:
         raise err(403, "无权操作该邀请或邀请不存在")
     return serialize_invitation(db, inv)
@@ -2820,9 +2855,7 @@ def schedule_purge(
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """安排或改期到期清除时刻。已开封资料同样可安排（到点照常清除正文）。"""
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以安排到期清除")
+    owner_document(db, doc_id, user, owner_message="只有封存人可以安排到期清除")
 
     purge_at = utc_str(payload.purge_at)
     now = utc_str(now_utc())
@@ -2837,7 +2870,9 @@ def schedule_purge(
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
-        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        # 锁内按当前名单复核封存人身份：交接确认可能在本事务等待写锁期间
+        # 提交，旧封存人随即失去权限（统一 403），本次安排/改期整体回滚
+        doc = owner_document(tx, doc_id, user, owner_message="只有封存人可以安排到期清除")
         if doc["status"] == "purged":
             # 清除可能刚在本临界区生效：必须先提交，错误延迟到提交后抛出
             post_commit_error = err(409, "资料已清除，不能再安排或改期清除")
@@ -2882,9 +2917,7 @@ def cancel_purge(
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """在清除时刻到来前取消已安排的到期清除。"""
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以取消到期清除")
+    owner_document(db, doc_id, user, owner_message="只有封存人可以取消到期清除")
 
     now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
@@ -2895,7 +2928,9 @@ def cancel_purge(
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
 
-        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        # 锁内按当前名单复核封存人身份：交接确认可能在本事务等待写锁期间
+        # 提交，旧封存人随即失去权限（统一 403），本次取消整体回滚
+        doc = owner_document(tx, doc_id, user, owner_message="只有封存人可以取消到期清除")
         if doc["status"] == "purged":
             post_commit_error = err(409, "资料已清除，不能取消清除")
         elif doc["purge_at"] is None:
@@ -2951,9 +2986,7 @@ def issue_view_pass(
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
     """封存人为已开封资料签发一次性阅览凭证。"""
-    doc = load_doc_for_participant(db, doc_id, user)
-    if doc["owner_id"] != user["id"]:
-        raise err(403, "只有封存人可以签发阅览凭证")
+    owner_document(db, doc_id, user, owner_message="只有封存人可以签发阅览凭证")
 
     expires_at = utc_str(payload.expires_at)
     now = utc_str(now_utc())
@@ -3182,14 +3215,11 @@ def file_objection(
     - 否则受理：失效进行中开封请求（旧同意删除）、阻止新开封申请，
       追加 objection_filed 审计并向当时参与方投递通知。
     """
-    doc = load_doc_for_participant(db, doc_id, user)
+    doc = participant_document(db, doc_id, user)
     if doc["owner_id"] == user["id"]:
         # 封存人本人不是该资料的“指定见证人”，沿用非参与方可见性语义
         raise err(403, "只有当前指定见证人可以提出异议")
-    if db.execute(
-        "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-        (doc_id, user["id"]),
-    ).fetchone() is None:
+    if not is_current_witness(db, doc_id, user["id"]):
         raise err(403, "只有当前指定见证人可以提出异议")
 
     post_commit_error: HTTPException | None = None
@@ -3205,10 +3235,7 @@ def file_objection(
             doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
 
             # 锁内以“当前名单”复核见证人身份（防预校验后被替换）
-            if doc["owner_id"] == user["id"] or tx.execute(
-                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                (doc_id, user["id"]),
-            ).fetchone() is None:
+            if doc["owner_id"] == user["id"] or not is_current_witness(tx, doc_id, user["id"]):
                 raise err(403, "只有当前指定见证人可以提出异议")
 
             if doc["status"] == "purged":
@@ -3365,11 +3392,7 @@ def dismiss_objection(
     if obj["objector_id"] == user["id"]:
         # 异议人不能驳回自己的异议
         raise err(403, "无权操作该异议或异议不存在")
-    is_witness = db.execute(
-        "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-        (obj["document_id"], user["id"]),
-    ).fetchone()
-    if is_witness is None:
+    if not is_current_witness(db, obj["document_id"], user["id"]):
         raise err(403, "无权操作该异议或异议不存在")
 
     post_commit_error: HTTPException | None = None
@@ -3388,10 +3411,7 @@ def dismiss_objection(
             # 锁内以“当前名单/异议人”复核（防名单替换、交接期间身份变化）
             if obj["objector_id"] == user["id"]:
                 raise err(403, "无权操作该异议或异议不存在")
-            if tx.execute(
-                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-                (doc["id"], user["id"]),
-            ).fetchone() is None:
+            if not is_current_witness(tx, doc["id"], user["id"]):
                 raise err(403, "只有其余两名当前指定见证人可以驳回异议")
 
             if obj["status"] == "archived" or archived_here:
@@ -3476,18 +3496,10 @@ def get_objection(
         raise err(403, "无权访问该异议或异议不存在")
     settle_due_purges_for_read(db, obj["document_id"], user)
     obj = db.execute("SELECT * FROM objections WHERE id = ?", (objection_id,)).fetchone()
-    doc = db.execute(
-        "SELECT owner_id FROM documents WHERE id = ?", (obj["document_id"],)
-    ).fetchone()
-    is_party = doc is not None and (
-        doc["owner_id"] == user["id"]
-        or db.execute(
-            "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-            (obj["document_id"], user["id"]),
-        ).fetchone() is not None
+    # 统一参与方判定：仅当前封存人或三名当前见证人可见；不存在与无权同一 403
+    participant_document(
+        db, obj["document_id"], user, not_found_message="无权访问该异议或异议不存在"
     )
-    if not is_party:
-        raise err(403, "无权访问该异议或异议不存在")
     return serialize_objection(db, obj)
 
 
@@ -3504,7 +3516,7 @@ def get_audit(
 ) -> dict[str, Any]:
     # 到清除时刻的资料先确定性清除，审计随即包含 purged 记录
     settle_due_purges_for_read(db, doc_id, user)
-    load_doc_for_participant(db, doc_id, user)
+    participant_document(db, doc_id, user)
     rows = db.execute(
         """SELECT a.id, a.at, a.action, a.request_id, a.detail,
                   u.username AS actor
@@ -3652,7 +3664,7 @@ def issue_audit_snapshot(
     组装快照并签名；签发动作本身追加一条审计记录（截止序号之前的状态即
     本次快照内容），响应不含正文与密钥。
     """
-    load_doc_for_participant(db, doc_id, user)
+    participant_document(db, doc_id, user)
 
     now = utc_str(now_utc())
     with authed_write_tx(db, user) as tx:
@@ -3662,11 +3674,7 @@ def issue_audit_snapshot(
 
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
         # 锁内复核参与方身份（交接/替换见证人可能与预校验并发）：以当前名单为准
-        is_party = doc["owner_id"] == user["id"] or tx.execute(
-            "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
-            (doc_id, user["id"]),
-        ).fetchone()
-        if not is_party:
+        if doc["owner_id"] != user["id"] and not is_current_witness(tx, doc_id, user["id"]):
             raise err(403, "无权访问该资料或资料不存在")
 
         snapshot = snapshots.build_snapshot(tx, doc)

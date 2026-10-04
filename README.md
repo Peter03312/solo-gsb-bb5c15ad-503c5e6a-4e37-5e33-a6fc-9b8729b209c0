@@ -96,6 +96,7 @@
 | 异议与见证变更 | 未决期间**不得替换异议人**（`409`，名单不变）；替换其他见证人时，旧人已投的驳回票即时删除失效、新见证人可凭原摘要驳回；封存人交接后异议不消失，继续约束新封存人（新封存人同样不能在异议终结前申请开封），见证名单不变故驳回权随当前名单 |
 | 异议与到期清除 | 到期清除照常执行；清除在写锁内先落库，其未决异议同事务置 `archived`（归档）并留审计/通知，之后撤回/驳回/再提异议一律 `409`，但异议元数据仍可被原参与方查询 |
 | 异议审计/通知/查询 | 受理 `objection_filed`、驳回计票 `objection_dismissal`、两票齐 `objection_dismissed`、撤回 `objection_withdrawn`、清除归档 `objection_archived`（连同受理时的 `request_invalidated`/`request_expired`）进入资料审计链与快照；受理与三类终结在同事务向“当时封存人 + 三名当前见证人”各投一条站内通知（事件序号取主审计序号）；`GET /objections/{id}` 仅当前参与方可见，只返回摘要/理由/状态/票数，**绝不返回正文** |
+| 统一参与方判定与写事务内复核 | 资料及其派生资源（审计、异议、快照签发、开封/替换/交接/清除/凭证等写操作）的“当前参与方”判定共用同一实现：当前封存人或当前指定见证人，以调用时刻（写事务内即 `BEGIN IMMEDIATE` 提交顺序位次）的当前名单为准。交接确认/见证人替换/账号停用提交后，旧身份立即失去资料、审计、异议与快照签发权限（统一 `403`，不区分资料/异议是否存在），新身份立即按现有规则得权；每个已认证写事务在锁内先复核密钥（失效密钥既有 `401` 并整体回滚，不触发到点结算、不留业务审计），再按当前名单复核角色（`403` 并整体回滚），并发身份变更与操作按提交顺序裁定。历史通知不回收；无账号的凭证兑换与公钥验真入口不变 |
 
 ### 请求状态机
 
@@ -640,6 +641,62 @@ curl -sS -X POST $BASE/register -H 'Content-Type: application/json' \
 可运行的端到端示例：`python examples/demo_account_deactivation.py`
 （覆盖义务拦截与义务清单、到点清除解除义务、停用后旧密钥 401、同名不可
 重注册、停用账号不能再被指定为见证人）。
+
+### 统一参与方判定与写事务内复核（权限边界）
+
+资料及其派生资源（审计、异议、快照签发、开封/替换/交接/清除/凭证等写操作）
+的授权判断统一为同一套**当前参与方**判定，读路径与写事务内复核共用：
+
+- **当前参与方** = 当前封存人或当前指定见证人，以调用时刻的当前名单为准；
+  写事务内即以该事务在 `BEGIN IMMEDIATE` 提交顺序中的位次所见名单为准。
+  资料编号、异议编号不存在与无权访问沿用同一 `403` 文案，无法探测存在性。
+- **身份变更即时生效**：封存人交接确认、见证人替换或账号停用一旦提交——
+  - 旧身份立即失去资料、审计、异议与快照签发权限（读与写统一 `403`，
+    不区分资料/异议是否存在）；
+  - 新身份立即按现有规则获得权限：新封存人可提交开封请求、安排/取消清除、
+    替换见证人、签发阅览凭证与审计快照；新见证人可同意、提异议、签发快照；
+  - **并发身份变更与操作按写事务提交顺序裁定**：每个已认证写事务进入临界区
+    后先复核密钥（失效密钥既有 `401`，整体回滚，不触发到点结算、不留业务
+    审计），再按当前名单复核角色（`403`，整体回滚）。交接确认若在旧封存人
+    的开封申请/撤销/替换/清除安排等待写锁期间提交，这些操作一律 `403` 回滚，
+    不会出现“交接后旧封存人又立起新请求/新安排”。
+- **失效密钥优先**：已轮换、已停用或根本不存在的密钥一律先返回既有 `401`
+  `{"detail":"凭据无效"}`（三者不可区分），不进入任何参与方判定，也不得
+  借读/写路径触发到期结算或留下业务审计。
+- **历史通知不回收**：被替换的旧见证人、交接后的旧封存人等失去资料权限的
+  账号，凭仍有效的密钥仍可读取/标记本人历史通知（通知不含正文/凭证/密钥）；
+  账号停用后密钥失效，通知接口随之返回既有 `401`。
+- **无账号入口不变**：`POST /view-passes/redeem`、
+  `GET /audit-snapshots/public-key`、`POST /audit-snapshots/verify`
+  仍无需任何凭据，行为与响应完全不变。
+
+```bash
+# 交接确认提交后：旧封存人立即 403（与资料不存在同一文案），新封存人立即可用
+curl -sS -X POST $BASE/handover-invitations/1/confirm -H "X-API-Key: $NEW_KEY"
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/documents/1 -H "X-API-Key: $OLD_KEY"
+# -> 403
+curl -sS $BASE/documents/1 -H "X-API-Key: $NEW_KEY"
+# -> 200 {"document_id":1,"status":"sealed",...}（开封前无 body）
+
+# 替换提交后：旧见证人同意/查资料/签发快照 403，新见证人可凭摘要补票
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/open-requests/7/approve \
+  -H "X-API-Key: $OLD_WITNESS_KEY" -H 'Content-Type: application/json' -d '{"digest":"ab12…"}'
+# -> 403
+
+# 停用提交后：旧密钥一律 401（与随机假密钥同文案）
+curl -sS -X POST $BASE/me/deactivation -H "X-API-Key: $GONE_KEY"
+curl -sS $BASE/documents/1 -H "X-API-Key: $GONE_KEY"
+# -> 401 {"detail":"凭据无效"}
+
+# 失权账号凭有效密钥仍可读/标记本人历史通知；无账号入口不变
+curl -sS "$BASE/notifications" -H "X-API-Key: $OLD_KEY"
+curl -sS -X POST $BASE/view-passes/redeem -H 'Content-Type: application/json' -d '{"token":"…"}'
+curl -sS -X POST $BASE/audit-snapshots/verify -H 'Content-Type: application/json' -d @verify_req.json
+```
+
+可运行的端到端示例：`python examples/demo_unified_authorization.py`
+（覆盖交接/替换/停用提交后的旧身份拒绝与新身份得权、编号不存在与无权同一
+拒绝、历史通知保留、无账号兑换与验真入口）。
 
 ### 需见证人确认的预封存（pre-seal proposal）
 
@@ -1187,6 +1244,7 @@ python3 examples/demo_notifications.py   # 站内通知：开封/替换/交接/�
 python3 examples/demo_api_key_rotation.py # 密钥轮换：一次性返回/旧密钥即时持久失效/401同文案/未轮换与无凭据接口不变
 python3 examples/demo_pre_seal.py        # 预封存：三人凭摘要确认同事务生成资料/重复不计票/撤回/到期失效/正文清空
 python3 examples/demo_objection.py       # 见证人异议：受理失效旧请求与旧票/两票驳回解除/撤回/不得替换异议人/替换他人旧驳回票失效/拒绝不留记录
+python3 examples/demo_unified_authorization.py # 统一权限边界：交接/替换/停用提交后旧身份即时失权、新身份即时得权、通知保留、无账号入口
 ```
 
 ### 典型拒绝场景
@@ -1293,6 +1351,16 @@ python -m pytest -q
 审计动作与票数正确，以及真实 uvicorn + 多线程的**并发异议只受理一件**与
 **第二票同意 vs 异议赛跑只产生一个终态**（开封+异议被拒，或异议受理+请求
 失效，互斥唯一）。
+统一权限边界测试覆盖：交接确认提交后旧封存人对资料/审计/异议/快照签发与全部
+封存人写操作统一 `403`、新封存人立即得权；替换提交后旧见证人失权、新见证人
+立即补票与签发；停用提交后旧密钥对资料/审计/异议/快照/通知一律既有 `401`
+（与随机假密钥同文案，先于任何参与方判定）；资料/异议编号不存在与无权同一
+`403` 文案；失权账号仍可读/标记本人历史通知且通知不含正文；无账号兑换与
+公钥验真入口不变；**写事务内复核**（模拟交接在业务写等待写锁期间提交：旧
+封存人的开封申请/撤销/替换/清除安排/取消一律 `403` 整体回滚，不写数据、
+不留业务审计），以及真实 uvicorn + 多线程的**并发交接确认 vs 旧封存人提交
+开封请求**（按提交顺序裁定：确认先提交则申请 `403` 回滚，申请先提交则确认
+将其 `invalidated`，互斥唯一）。
 
 ## 项目结构
 
@@ -1303,11 +1371,11 @@ app/
   schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、清除时刻、阅览凭证、预封存提案/确认、快照验真入参、见证人异议/驳回入参校验）
   ed25519.py    # Ed25519 签名（RFC 8032）纯标准库实现，无第三方依赖
   snapshots.py  # 审计快照：canonical-json-v1 规范化、签名密钥持久化、公钥 PEM/指纹、快照组装与签名
-  main.py       # FastAPI 路由、认证、定时开封+到期清除+预封存到期+过期扫描器、全部业务规则（见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核、预封存提案发起/查看/确认/撤回与三人齐同事务生成资料、账号停用前到点结算与未了义务核对、见证人异议受理/撤回/两票驳回/清除归档与见证变更/交接联动）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+预封存到期+过期扫描器、全部业务规则（统一参与方判定与写事务内复核、见证人替换、封存人交接、到期清除、审计快照签发与验真、一次性阅览凭证签发/兑换/撤销、站内通知投递/游标分页/标记已读、API Key 轮换与写锁内密钥复核、预封存提案发起/查看/确认/撤回与三人齐同事务生成资料、账号停用前到点结算与未了义务核对、见证人异议受理/撤回/两票驳回/清除归档与见证变更/交接联动）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py / demo_pre_seal.py / demo_objection.py / demo_account_deactivation.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、预封存提案、账号停用、见证人异议、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py / demo_audit_snapshot.py / demo_view_pass.py / demo_notifications.py / demo_api_key_rotation.py / demo_pre_seal.py / demo_objection.py / demo_account_deactivation.py / demo_unified_authorization.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、审计快照、阅览凭证、站内通知、密钥轮换、预封存提案、账号停用、见证人异议、统一权限边界、并发、重启）
 Dockerfile
 docker-compose.yml
 ```
